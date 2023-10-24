@@ -34,9 +34,8 @@ class Servidor:
 
         if (flags & FLAGS_SYN) == FLAGS_SYN:
             # A flag SYN estar setada significa que é um cliente tentando estabelecer uma conexão nova
-            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no)
-            # TODO: você precisa fazer o handshake aceitando a conexão. Escolha se você acha melhor
-            # fazer aqui mesmo ou dentro da classe Conexao.
+            conexao = self.conexoes[id_conexao] = Conexao(self, id_conexao, seq_no, window_size)
+
             if self.callback:
                 self.callback(conexao)
         elif id_conexao in self.conexoes:
@@ -48,17 +47,21 @@ class Servidor:
 
 
 class Conexao:
-    def __init__(self, servidor, id_conexao, seq_no):
+    def __init__(self, servidor, id_conexao, seq_no, window_size):
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
+        self.current_window_size = window_size
         self.current_seq_no = randint(0, 0xffff)
         self.expected_seq_no = seq_no + 1
 
         # Responde com SYNACK para a abertura de conexão
-        segment = make_header(self.id_conexao[3], self.id_conexao[1], self.current_seq_no, self.expected_seq_no, FLAGS_SYN | FLAGS_ACK)
-        segment = fix_checksum(segment, self.id_conexao[2], self.id_conexao[0])
-        self.servidor.rede.enviar(segment, self.id_conexao[0])
+        self.enviar_segmento(
+            self.current_seq_no,
+            self.expected_seq_no,
+            FLAGS_SYN | FLAGS_ACK,
+            b'',
+        )
         self.current_seq_no += 1
 
         self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
@@ -74,23 +77,20 @@ class Conexao:
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         print('recebido payload: %r' % payload)
 
+        # Apenas um ACK
+        if (flags & FLAGS_ACK) == FLAGS_ACK and len(payload) == 0:
+            return
+
         if seq_no == self.expected_seq_no:
             self.expected_seq_no += len(payload)
             self.callback(self, payload)
 
-        segment = make_header(
-            self.id_conexao[3],
-            self.id_conexao[1],
+        self.enviar_segmento(
             self.current_seq_no,
             self.expected_seq_no,
             FLAGS_ACK,
+            b'',
         )
-        segment = fix_checksum(
-            segment,
-            self.id_conexao[2],
-            self.id_conexao[0]
-        )
-        self.servidor.rede.enviar(segment, self.id_conexao[0])
 
     # Os métodos abaixo fazem parte da API
 
@@ -105,10 +105,43 @@ class Conexao:
         """
         Usado pela camada de aplicação para enviar dados
         """
-        # TODO: implemente aqui o envio de dados.
-        # Chame self.servidor.rede.enviar(segmento, dest_addr) para enviar o segmento
-        # que você construir para a camada de rede.
-        pass
+
+        while len(dados) > MSS:
+            print(f'{len(dados)} / {MSS}')
+            self.enviar_segmento(
+                self.current_seq_no,
+                self.expected_seq_no,
+                FLAGS_ACK,
+                dados[:MSS]
+            )
+            self.current_seq_no += MSS
+            dados = dados[MSS:]
+
+        print(f'{len(dados)} / {MSS}')
+        self.enviar_segmento(
+            self.current_seq_no,
+            self.expected_seq_no,
+            FLAGS_ACK,
+            dados
+        )
+        self.current_seq_no += len(dados)
+
+    def enviar_segmento(self, seq_no, ack_no, flags, payload):
+        segment = make_header(
+            self.id_conexao[3],
+            self.id_conexao[1],
+            seq_no,
+            ack_no,
+            flags,
+        )
+        segment = segment + payload
+        segment = fix_checksum(
+            segment,
+            self.id_conexao[2],
+            self.id_conexao[0]
+        )
+
+        self.servidor.rede.enviar(segment, self.id_conexao[0])
 
     def fechar(self):
         """
