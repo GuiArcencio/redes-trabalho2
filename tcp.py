@@ -52,12 +52,14 @@ class Conexao:
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
-        self.seq_no = randint(0, 0xffff)
+        self.current_seq_no = randint(0, 0xffff)
+        self.expected_seq_no = seq_no + 1
 
         # Responde com SYNACK para a abertura de conexão
-        segment = make_header(self.id_conexao[3], self.id_conexao[1], self.seq_no, seq_no+1, FLAGS_SYN | FLAGS_ACK)
+        segment = make_header(self.id_conexao[3], self.id_conexao[1], self.current_seq_no, self.expected_seq_no, FLAGS_SYN | FLAGS_ACK)
         segment = fix_checksum(segment, self.id_conexao[2], self.id_conexao[0])
         self.servidor.rede.enviar(segment, self.id_conexao[0])
+        self.current_seq_no += 1
 
         self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
         #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
@@ -71,6 +73,24 @@ class Conexao:
         # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
         # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         print('recebido payload: %r' % payload)
+
+        if seq_no == self.expected_seq_no:
+            self.expected_seq_no += len(payload)
+            self.callback(self, payload)
+
+        segment = make_header(
+            self.id_conexao[3],
+            self.id_conexao[1],
+            self.current_seq_no,
+            self.expected_seq_no,
+            FLAGS_ACK,
+        )
+        segment = fix_checksum(
+            segment,
+            self.id_conexao[2],
+            self.id_conexao[0]
+        )
+        self.servidor.rede.enviar(segment, self.id_conexao[0])
 
     # Os métodos abaixo fazem parte da API
 
