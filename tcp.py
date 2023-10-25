@@ -44,7 +44,9 @@ class Servidor:
         else:
             print('%s:%d -> %s:%d (pacote associado a conexão desconhecida)' %
                   (src_addr, src_port, dst_addr, dst_port))
-
+            
+    def remover_conexao(self, id_conexao):
+        self.conexoes.pop(id_conexao, None)
 
 class Conexao:
     def __init__(self, servidor, id_conexao, seq_no, window_size):
@@ -54,6 +56,7 @@ class Conexao:
         self.current_window_size = window_size
         self.current_seq_no = randint(0, 0xffff)
         self.expected_seq_no = seq_no + 1
+        self.prestes_a_fechar = False
 
         # Responde com SYNACK para a abertura de conexão
         self.enviar_segmento(
@@ -72,10 +75,25 @@ class Conexao:
         print('Este é um exemplo de como fazer um timer')
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
-        # TODO: trate aqui o recebimento de segmentos provenientes da camada de rede.
-        # Chame self.callback(self, dados) para passar dados para a camada de aplicação após
-        # garantir que eles não sejam duplicados e que tenham sido recebidos em ordem.
         print('recebido payload: %r' % payload)
+
+        # ACK do fechamento
+        if self.prestes_a_fechar:
+            self.servidor.remover_conexao(self.id_conexao)
+            return
+
+        # Fechamento de conexão
+        if (flags & FLAGS_FIN) == FLAGS_FIN:
+            self.expected_seq_no += 1
+            self.enviar_segmento(
+                self.current_seq_no,
+                self.expected_seq_no,
+                FLAGS_ACK,
+                b''
+            )
+            self.callback(self, b'')
+            return
+
 
         # Apenas um ACK
         if (flags & FLAGS_ACK) == FLAGS_ACK and len(payload) == 0:
@@ -147,5 +165,10 @@ class Conexao:
         """
         Usado pela camada de aplicação para fechar a conexão
         """
-        # TODO: implemente aqui o fechamento de conexão
-        pass
+        self.prestes_a_fechar = True
+        self.enviar_segmento(
+            self.current_seq_no,
+            self.expected_seq_no,
+            FLAGS_FIN,
+            b'',
+        )
