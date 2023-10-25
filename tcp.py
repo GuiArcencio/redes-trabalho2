@@ -53,8 +53,11 @@ class Conexao:
         self.servidor = servidor
         self.id_conexao = id_conexao
         self.callback = None
+        self.timer = None
+        self.unacked_segments = []
         self.current_window_size = window_size
         self.current_seq_no = randint(0, 0xffff)
+        self.last_acked_no = self.current_seq_no
         self.expected_seq_no = seq_no + 1
         self.prestes_a_fechar = False
 
@@ -65,22 +68,9 @@ class Conexao:
             FLAGS_SYN | FLAGS_ACK,
             b'',
         )
-        self.current_seq_no += 1
-
-        self.timer = asyncio.get_event_loop().call_later(1, self._exemplo_timer)  # um timer pode ser criado assim; esta linha é só um exemplo e pode ser removida
-        #self.timer.cancel()   # é possível cancelar o timer chamando esse método; esta linha é só um exemplo e pode ser removida
-
-    def _exemplo_timer(self):
-        # Esta função é só um exemplo e pode ser removida
-        print('Este é um exemplo de como fazer um timer')
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         print('recebido payload: %r' % payload)
-
-        # ACK do fechamento
-        if self.prestes_a_fechar:
-            self.servidor.remover_conexao(self.id_conexao)
-            return
 
         # Fechamento de conexão
         if (flags & FLAGS_FIN) == FLAGS_FIN:
@@ -94,10 +84,34 @@ class Conexao:
             self.callback(self, b'')
             return
 
+        # Um ACK
+        if (flags & FLAGS_ACK) == FLAGS_ACK:
+            if ack_no > self.last_acked_no:
+                if self.timer is not None:
+                    self.timer.cancel()
+                    self.timer = None
 
-        # Apenas um ACK
-        if (flags & FLAGS_ACK) == FLAGS_ACK and len(payload) == 0:
-            return
+                self.last_acked_no = ack_no
+                smallest_unacked_segment_idx = None
+                for i, (unacked_seq_no, unacked_segment) in enumerate(self.unacked_segments):
+                    if unacked_seq_no > self.last_acked_no - 1:
+                        smallest_unacked_segment_idx = i
+                        break
+
+                if smallest_unacked_segment_idx is None:
+                    self.unacked_segments = []
+                else:
+                    self.unacked_segments = self.unacked_segments[i:]
+                    self.timer = asyncio.get_event_loop().call_later(0.5, self._resend_timer)
+
+            # ACK do fechamento
+            if self.prestes_a_fechar:
+                self.servidor.remover_conexao(self.id_conexao)
+                return
+
+            # Não precisa responder
+            if len(payload) == 0:
+                return
 
         if seq_no == self.expected_seq_no:
             self.expected_seq_no += len(payload)
@@ -125,24 +139,20 @@ class Conexao:
         """
 
         while len(dados) > MSS:
-            print(f'{len(dados)} / {MSS}')
             self.enviar_segmento(
                 self.current_seq_no,
                 self.expected_seq_no,
                 FLAGS_ACK,
                 dados[:MSS]
             )
-            self.current_seq_no += MSS
             dados = dados[MSS:]
 
-        print(f'{len(dados)} / {MSS}')
         self.enviar_segmento(
             self.current_seq_no,
             self.expected_seq_no,
             FLAGS_ACK,
             dados
         )
-        self.current_seq_no += len(dados)
 
     def enviar_segmento(self, seq_no, ack_no, flags, payload):
         segment = make_header(
@@ -158,8 +168,22 @@ class Conexao:
             self.id_conexao[2],
             self.id_conexao[0]
         )
-
+        self.unacked_segments.append((seq_no, segment))
         self.servidor.rede.enviar(segment, self.id_conexao[0])
+
+        if (flags & FLAGS_SYN) == FLAGS_SYN or (flags & FLAGS_FIN) == FLAGS_FIN:
+            self.current_seq_no += 1
+        else:
+            self.current_seq_no += len(payload)
+
+        if self.timer is None:
+            self.timer = asyncio.get_event_loop().call_later(0.5, self._resend_timer)
+
+    def _resend_timer(self):
+        if len(self.unacked_segments) > 0:
+            self.servidor.rede.enviar(self.unacked_segments[0][1], self.id_conexao[0])
+        
+        self.timer = asyncio.get_event_loop().call_later(0.5, self._resend_timer)
 
     def fechar(self):
         """
