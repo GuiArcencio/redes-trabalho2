@@ -1,5 +1,6 @@
 import asyncio
 from random import randint
+from time import time
 from grader.tcputils import *
 
 
@@ -48,6 +49,8 @@ class Servidor:
     def remover_conexao(self, id_conexao):
         self.conexoes.pop(id_conexao, None)
 
+ALPHA = 0.125
+BETA = 0.25
 class Conexao:
     def __init__(self, servidor, id_conexao, seq_no, window_size):
         self.servidor = servidor
@@ -55,11 +58,14 @@ class Conexao:
         self.callback = None
         self.timer = None
         self.unacked_segments = []
+        self.estimated_rtt = None
+        self.dev_rtt = None
         self.current_window_size = window_size
         self.current_seq_no = randint(0, 0xffff)
         self.last_acked_no = self.current_seq_no
         self.expected_seq_no = seq_no + 1
         self.prestes_a_fechar = False
+        self.handshake_completo = False
 
         # Responde com SYNACK para a abertura de conexão
         self.enviar_segmento(
@@ -68,6 +74,31 @@ class Conexao:
             FLAGS_SYN | FLAGS_ACK,
             b'',
         )
+
+    def timeout_interval(self):
+        """
+        Calcula o timeout com base no RTT estimado
+        """
+        if self.estimated_rtt is None:
+            return 3
+        else:
+            return self.estimated_rtt + 4 * self.dev_rtt
+        
+    def estimar_rtt(self, sample_rtt):
+        """
+        Nova estimativa para o RTT
+        """
+        if not self.handshake_completo:
+            # Não use o ACK de abertura de conexão para estimar
+            self.handshake_completo = True
+            return
+
+        if self.estimated_rtt is None:
+            self.estimated_rtt = sample_rtt
+            self.dev_rtt = sample_rtt / 2
+        else:
+            self.estimated_rtt = (1-ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
+            self.dev_rtt = (1-BETA) * self.dev_rtt + BETA * abs(sample_rtt - self.estimated_rtt)
 
     def _rdt_rcv(self, seq_no, ack_no, flags, payload):
         print('recebido payload: %r' % payload)
@@ -86,23 +117,39 @@ class Conexao:
 
         # Um ACK
         if (flags & FLAGS_ACK) == FLAGS_ACK:
+            # Um novo pacote foi ACKED!
             if ack_no > self.last_acked_no:
                 if self.timer is not None:
                     self.timer.cancel()
                     self.timer = None
 
                 self.last_acked_no = ack_no
+
+                # Verifica se algum dos pacotes enviados
+                # ainda não foi reconhecido
                 smallest_unacked_segment_idx = None
-                for i, (unacked_seq_no, unacked_segment) in enumerate(self.unacked_segments):
+                for i, (unacked_seq_no, _, _, _) in enumerate(self.unacked_segments):
                     if unacked_seq_no > self.last_acked_no - 1:
                         smallest_unacked_segment_idx = i
                         break
 
+                # Todos os pacotes enviados já foram reconhecidos
                 if smallest_unacked_segment_idx is None:
+                    if not self.unacked_segments[-1][3]:
+                        # Um pacote não-retransmitido foi reconhecido,
+                        # então deve-se estimar o novo RTT
+                        self.estimar_rtt(time() - self.unacked_segments[-1][2])
+
                     self.unacked_segments = []
+                # Ainda há pacotes sem um ACK
                 else:
+                    if i > 0 and not self.unacked_segments[i-1][3]:
+                        # Um pacote não-retransmitido foi reconhecido,
+                        # então deve-se estimar o novo RTT
+                        self.estimar_rtt(time() - self.unacked_segments[i-1][2])
+
                     self.unacked_segments = self.unacked_segments[i:]
-                    self.timer = asyncio.get_event_loop().call_later(0.5, self._resend_timer)
+                    self.timer = asyncio.get_event_loop().call_later(self.timeout_interval(), self._resend_timer)
 
             # ACK do fechamento
             if self.prestes_a_fechar:
@@ -168,7 +215,7 @@ class Conexao:
             self.id_conexao[2],
             self.id_conexao[0]
         )
-        self.unacked_segments.append((seq_no, segment))
+        self.unacked_segments.append((seq_no, segment, time(), False))
         self.servidor.rede.enviar(segment, self.id_conexao[0])
 
         if (flags & FLAGS_SYN) == FLAGS_SYN or (flags & FLAGS_FIN) == FLAGS_FIN:
@@ -177,13 +224,14 @@ class Conexao:
             self.current_seq_no += len(payload)
 
         if self.timer is None:
-            self.timer = asyncio.get_event_loop().call_later(0.5, self._resend_timer)
+            self.timer = asyncio.get_event_loop().call_later(self.timeout_interval(), self._resend_timer)
 
     def _resend_timer(self):
         if len(self.unacked_segments) > 0:
             self.servidor.rede.enviar(self.unacked_segments[0][1], self.id_conexao[0])
+            self.unacked_segments[0] = (*self.unacked_segments[0][:3], True)
         
-        self.timer = asyncio.get_event_loop().call_later(0.5, self._resend_timer)
+        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval(), self._resend_timer)
 
     def fechar(self):
         """
