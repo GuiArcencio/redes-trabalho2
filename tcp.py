@@ -58,9 +58,10 @@ class Conexao:
         self.callback = None
         self.timer = None
         self.unacked_segments = []
+        self.fila_de_envio = []
         self.estimated_rtt = None
         self.dev_rtt = None
-        self.current_window_size = window_size
+        self.current_window_size = 1 # * MSS
         self.current_seq_no = randint(0, 0xffff)
         self.last_acked_no = self.current_seq_no
         self.expected_seq_no = seq_no + 1
@@ -68,14 +69,12 @@ class Conexao:
         self.handshake_completo = False
 
         # Responde com SYNACK para a abertura de conexão
-        self.enviar_segmento(
-            self.current_seq_no,
-            self.expected_seq_no,
+        self._enviar_segmento(
             FLAGS_SYN | FLAGS_ACK,
             b'',
         )
 
-    def timeout_interval(self):
+    def _timeout_interval(self):
         """
         Calcula o timeout com base no RTT estimado
         """
@@ -84,7 +83,7 @@ class Conexao:
         else:
             return self.estimated_rtt + 4 * self.dev_rtt
         
-    def estimar_rtt(self, sample_rtt):
+    def _estimar_rtt(self, sample_rtt):
         """
         Nova estimativa para o RTT
         """
@@ -106,9 +105,7 @@ class Conexao:
         # Fechamento de conexão
         if (flags & FLAGS_FIN) == FLAGS_FIN:
             self.expected_seq_no += 1
-            self.enviar_segmento(
-                self.current_seq_no,
-                self.expected_seq_no,
+            self._enviar_segmento(
                 FLAGS_ACK,
                 b''
             )
@@ -124,6 +121,9 @@ class Conexao:
                     self.timer = None
 
                 self.last_acked_no = ack_no
+                # Ajusta o tamanho da janela com o novo ACK
+                if self.handshake_completo:
+                    self.current_window_size += 1
 
                 # Verifica se algum dos pacotes enviados
                 # ainda não foi reconhecido
@@ -138,7 +138,7 @@ class Conexao:
                     if not self.unacked_segments[-1][3]:
                         # Um pacote não-retransmitido foi reconhecido,
                         # então deve-se estimar o novo RTT
-                        self.estimar_rtt(time() - self.unacked_segments[-1][2])
+                        self._estimar_rtt(time() - self.unacked_segments[-1][2])
 
                     self.unacked_segments = []
                 # Ainda há pacotes sem um ACK
@@ -146,17 +146,20 @@ class Conexao:
                     if i > 0 and not self.unacked_segments[i-1][3]:
                         # Um pacote não-retransmitido foi reconhecido,
                         # então deve-se estimar o novo RTT
-                        self.estimar_rtt(time() - self.unacked_segments[i-1][2])
+                        self._estimar_rtt(time() - self.unacked_segments[i-1][2])
 
                     self.unacked_segments = self.unacked_segments[i:]
-                    self.timer = asyncio.get_event_loop().call_later(self.timeout_interval(), self._resend_timer)
+                    self.timer = asyncio.get_event_loop().call_later(self._timeout_interval(), self._resend_timer)
+
+                # Com um ACK, podemos tentar enviar o que está na fila
+                self._enviar_fila()
 
             # ACK do fechamento
             if self.prestes_a_fechar:
                 self.servidor.remover_conexao(self.id_conexao)
                 return
 
-            # Não precisa responder
+            # Não precisa responder com um ACK se foi só um ACK vazio
             if len(payload) == 0:
                 return
 
@@ -164,12 +167,70 @@ class Conexao:
             self.expected_seq_no += len(payload)
             self.callback(self, payload)
 
-        self.enviar_segmento(
-            self.current_seq_no,
-            self.expected_seq_no,
+        self._enviar_segmento(
             FLAGS_ACK,
             b'',
         )
+
+    def _calcular_bytes_inflight(self):
+        if len(self.unacked_segments) == 0:
+            return 0
+        else:
+            return self.unacked_segments[-1][0] - self.last_acked_no + 1
+    
+    def _enviar_segmento(self, flags, payload):
+        """
+        Adiciona um segmento à fila de envio
+        """
+
+        # Separa os dados em pacotes de 1MSS
+        while len(payload) > MSS:
+            self.fila_de_envio.append((self.current_seq_no, flags, payload[:MSS]))
+            self.current_seq_no += MSS
+            payload = payload[MSS:]
+
+        self.fila_de_envio.append((self.current_seq_no, flags, payload))
+        self.current_seq_no += len(payload)
+        if len(payload) == 0 and ((flags & FLAGS_SYN) == FLAGS_SYN or (flags & FLAGS_FIN) == FLAGS_FIN):
+            self.current_seq_no += 1
+
+        # Tenta enviar o que já está na fila
+        self._enviar_fila()
+
+    def _enviar_fila(self):
+        while len(self.fila_de_envio) > 0 and self._calcular_bytes_inflight() + len(self.fila_de_envio[0][2]) <= self.current_window_size * MSS:
+            seq_no, flags, payload = self.fila_de_envio.pop(0)
+
+            segment = make_header(
+                self.id_conexao[3],
+                self.id_conexao[1],
+                seq_no,
+                self.expected_seq_no,
+                flags,
+            )
+            segment = segment + payload
+            segment = fix_checksum(
+                segment,
+                self.id_conexao[2],
+                self.id_conexao[0]
+            )
+
+            self.unacked_segments.append((seq_no, segment, time(), False))
+            self.servidor.rede.enviar(segment, self.id_conexao[0])
+
+            if self.timer is None:
+                self.timer = asyncio.get_event_loop().call_later(self._timeout_interval(), self._resend_timer)
+
+    def _resend_timer(self):
+        if len(self.unacked_segments) > 0:
+            # Houve uma perda! Devemos diminuir a janela pela metade
+            self.current_window_size = max(1, self.current_window_size // 2)
+
+            self.servidor.rede.enviar(self.unacked_segments[0][1], self.id_conexao[0])
+            self.unacked_segments[0] = (*self.unacked_segments[0][:3], True)
+        
+        self.timer = asyncio.get_event_loop().call_later(self._timeout_interval(), self._resend_timer)
+
 
     # Os métodos abaixo fazem parte da API
 
@@ -184,63 +245,17 @@ class Conexao:
         """
         Usado pela camada de aplicação para enviar dados
         """
-
-        while len(dados) > MSS:
-            self.enviar_segmento(
-                self.current_seq_no,
-                self.expected_seq_no,
-                FLAGS_ACK,
-                dados[:MSS]
-            )
-            dados = dados[MSS:]
-
-        self.enviar_segmento(
-            self.current_seq_no,
-            self.expected_seq_no,
+        self._enviar_segmento(
             FLAGS_ACK,
             dados
         )
-
-    def enviar_segmento(self, seq_no, ack_no, flags, payload):
-        segment = make_header(
-            self.id_conexao[3],
-            self.id_conexao[1],
-            seq_no,
-            ack_no,
-            flags,
-        )
-        segment = segment + payload
-        segment = fix_checksum(
-            segment,
-            self.id_conexao[2],
-            self.id_conexao[0]
-        )
-        self.unacked_segments.append((seq_no, segment, time(), False))
-        self.servidor.rede.enviar(segment, self.id_conexao[0])
-
-        if (flags & FLAGS_SYN) == FLAGS_SYN or (flags & FLAGS_FIN) == FLAGS_FIN:
-            self.current_seq_no += 1
-        else:
-            self.current_seq_no += len(payload)
-
-        if self.timer is None:
-            self.timer = asyncio.get_event_loop().call_later(self.timeout_interval(), self._resend_timer)
-
-    def _resend_timer(self):
-        if len(self.unacked_segments) > 0:
-            self.servidor.rede.enviar(self.unacked_segments[0][1], self.id_conexao[0])
-            self.unacked_segments[0] = (*self.unacked_segments[0][:3], True)
-        
-        self.timer = asyncio.get_event_loop().call_later(self.timeout_interval(), self._resend_timer)
 
     def fechar(self):
         """
         Usado pela camada de aplicação para fechar a conexão
         """
         self.prestes_a_fechar = True
-        self.enviar_segmento(
-            self.current_seq_no,
-            self.expected_seq_no,
+        self._enviar_segmento(
             FLAGS_FIN,
             b'',
         )
